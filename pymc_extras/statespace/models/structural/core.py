@@ -750,6 +750,99 @@ class Component:
             new_prop.update(getattr(other, name))
             return new_prop
 
+    def _combine_property_2(self, other, name, allow_duplicates=True):
+        """
+        Combine a property from two components during component addition.
+
+        This method handles the merging of component properties when two structural
+        components are combined using the `+` operator. It handles different data types
+        appropriately and provides control over duplicate handling for list properties.
+
+        Parameters
+        ----------
+        other : Component
+            The other component whose property is being combined with this one.
+        name : str
+            The name of the property to combine (e.g., 'state_names', 'param_names').
+        allow_duplicates : bool, default True
+            Controls duplicate handling for list properties:
+            - True: Concatenates lists directly, preserving duplicates
+            - False: Adds only items from `other` that aren't already in `self`
+
+        Returns
+        -------
+        Any
+            Combined property value with type depending on the property type:
+            - list: Concatenated lists (with or without deduplication)
+            - dict: Merged dictionaries (other overwrites self for same keys)
+            - scalar/array: Single value (if identical) or error (if different)
+
+        Raises
+        ------
+        ValueError
+            When scalar properties have different non-None values that cannot be
+            automatically combined, indicating unclear user intent.
+        """
+        self_prop = getattr(self, name)
+        other_prop = getattr(other, name)
+
+        if isinstance(self_prop, list) and allow_duplicates:
+            return self_prop + other_prop
+        elif isinstance(self_prop, list) and not allow_duplicates:
+            return self_prop + [x for x in other_prop if x not in self_prop]
+        elif isinstance(self_prop, dict):
+            new_prop = self_prop.copy()
+            new_prop.update(other_prop)
+            return new_prop
+        else:
+            # NEW: Handle cases where self_prop is not a list or dict
+            import numpy as np
+
+            # Handle numpy arrays specially
+            if isinstance(self_prop, np.ndarray) and isinstance(other_prop, np.ndarray):
+                if np.array_equal(self_prop, other_prop):
+                    return self_prop
+                else:
+                    # Convert to list for combination when arrays are different
+                    return (
+                        list(self_prop) + [x for x in other_prop if x not in self_prop]
+                        if not allow_duplicates
+                        else list(self_prop) + list(other_prop)
+                    )
+            elif isinstance(self_prop, np.ndarray) or isinstance(other_prop, np.ndarray):
+                # One is array, one is not - convert to list
+                self_list = (
+                    list(self_prop)
+                    if isinstance(self_prop, np.ndarray)
+                    else [self_prop]
+                    if self_prop is not None
+                    else []
+                )
+                other_list = (
+                    list(other_prop)
+                    if isinstance(other_prop, np.ndarray)
+                    else [other_prop]
+                    if other_prop is not None
+                    else []
+                )
+                return (
+                    self_list + [x for x in other_list if x not in self_list]
+                    if not allow_duplicates
+                    else self_list + other_list
+                )
+            elif self_prop == other_prop:
+                return self_prop
+            elif self_prop is None and other_prop is not None:
+                return other_prop
+            elif self_prop is not None and other_prop is None:
+                return self_prop
+            else:
+                # Different non-None values - this might indicate a problem
+                raise ValueError(
+                    f"Cannot combine property '{name}': component values are different "
+                    f"({self_prop} vs {other_prop}) and cannot be automatically combined"
+                )
+
     def _combine_component_info(self, other):
         combined_info = {}
         for key, value in self._component_info.items():
