@@ -39,7 +39,7 @@ class CycleComponent(Component):
         parameter, ``sigma_{name}`` will be added to the model.
         For multivariate time series, this is a vector (variable-specific innovation variances).
 
-    observed_state_names: list[str], optional
+    observed_state_names: Sequence[str] | NDArray, optional
         Names of the observed state variables. For univariate time series, defaults to ``["data"]``.
         For multivariate time series, specify a list of names for each endogenous variable.
 

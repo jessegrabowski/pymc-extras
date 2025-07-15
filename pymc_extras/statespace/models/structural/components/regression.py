@@ -24,8 +24,8 @@ class RegressionComponent(Component):
         k_exog. If None and k_exog is provided, coefficients will be named
         "{name}_1, {name}_2, ...".
 
-    observed_state_names : list[str] | None, default None
-        List of strings for observed state labels. If None, defaults to ["data"].
+    observed_state_names : Sequence[str] | NDArray | None, default None
+        Sequence of strings for observed state labels. If None, defaults to ["data"].
 
     innovations : bool, default False
         Whether to include stochastic innovations in the regression coefficients,
