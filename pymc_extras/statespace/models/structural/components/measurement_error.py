@@ -15,7 +15,7 @@ class MeasurementError(Component):
     ----------
     name : str, optional
         Name of the measurement error component. Default is "MeasurementError".
-    observed_state_names : list[str] | None, optional
+    observed_state_names : Sequence[str] | NDArray | None, optional
         Names of the observed variables. If None, defaults to ["data"].
 
     Notes

@@ -36,8 +36,8 @@ class TimeSeasonality(Component):
         included in the model, but it will not be identified -- you will need to handle this in the priors (e.g. with
         ZeroSumNormal).
 
-    observed_state_names: list[str] | None, default None
-        List of strings for observed state labels. If None, defaults to ["data"].
+    observed_state_names: Sequence[str] | NDArray | None, default None
+        Sequence of strings for observed state labels. If None, defaults to ["data"].
 
     Notes
     -----

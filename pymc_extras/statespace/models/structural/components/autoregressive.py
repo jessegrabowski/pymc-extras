@@ -20,8 +20,8 @@ class AutoregressiveComponent(Component):
     name: str, default "auto_regressive"
         A name for this autoregressive component. Used to label dimensions and coordinates.
 
-    observed_state_names: list[str] | None, default None
-        List of strings for observed state labels. If None, defaults to ["data"].
+    observed_state_names: Sequence[str] | NDArray | None, default None
+        Sequence of strings for observed state labels. If None, defaults to ["data"].
 
     Notes
     -----
