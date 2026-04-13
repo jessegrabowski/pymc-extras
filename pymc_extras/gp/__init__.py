@@ -13,6 +13,15 @@
 #   limitations under the License.
 
 
+from pymc_extras.gp.fit import fit_jax, fit_mlx
 from pymc_extras.gp.latent_approx import KarhunenLoeveExpansion, ProjectedProcess
+from pymc_extras.gp.svgp import SVGP, WhitenedSVGP
 
-__all__ = ["KarhunenLoeveExpansion", "ProjectedProcess", "SVGP"]
+__all__ = [
+    "KarhunenLoeveExpansion",
+    "ProjectedProcess",
+    "SVGP",
+    "WhitenedSVGP",
+    "fit_jax",
+    "fit_mlx",
+]
