@@ -26,14 +26,25 @@ class SVGP:
     ):
         self.mean_func = mean_func
         self.cov_func = cov_func
-        self.sigma = sigma
         self.jitter = jitter
+
+        # Store sigma by name (for model RVs) so we can look it up fresh
+        # from the model later, avoiding stale pytensor variable references.
+        # For plain numeric sigma, store the value directly.
+        self._sigma_name = getattr(sigma, "name", None)
+        self._sigma_const = sigma if self._sigma_name is None else None
 
         self.z_init = z_init
         self.n_inducing = z_init.shape[0]
         self.input_dim = z_init.shape[1]
 
         self.initialize()
+
+    def _get_sigma(self, model=None):
+        """Look up sigma fresh from the model (for RVs) or return the stored constant."""
+        if self._sigma_name is not None:
+            return pm.modelcontext(model)[self._sigma_name]
+        return self._sigma_const
 
     def initialize(self, model=None):
         n = self.n_inducing
@@ -117,42 +128,47 @@ class SVGP:
         variance = Kxx_diag - pt.sum(Lz_inv_Kzx**2, axis=0) + pt.sum(Lq_T_Kzz_inv_Kzx**2, axis=0)
         return mean, variance
 
-    def variational_expectation(self, X_batch, y_batch):
+    def variational_expectation(self, X_batch, y_batch, model=None):
+        sigma = self._get_sigma(model)
         mean, variance = self.predict_diag(X_batch)
         y_flat = pt.squeeze(y_batch, axis=-1)
         sq_error = pt.square(y_flat - mean)
         log_two_pi = np.log(2.0 * np.pi)
-        log_sigma2 = 2.0 * pt.log(self.sigma)
-        return -0.5 * (log_two_pi + log_sigma2 + (sq_error + variance) / self.sigma**2)
+        log_sigma2 = 2.0 * pt.log(sigma)
+        return -0.5 * (log_two_pi + log_sigma2 + (sq_error + variance) / sigma**2)
 
-    def elbo(self, X_batch, y_batch, n_data):
-        var_exp = self.variational_expectation(X_batch, y_batch)
+    def elbo(self, X_batch, y_batch, n_data, model=None):
+        var_exp = self.variational_expectation(X_batch, y_batch, model=model)
         batch_size = y_batch.shape[0]
         return (n_data / batch_size) * pt.sum(var_exp) - self.kl_divergence()
 
-    def compile_pred_func(self, sigma=None, diag=False, mode="FAST_RUN", model=None):
+    def compile_pred_func(self, diag=False, include_noise=True, mode="FAST_RUN", model=None):
         """Compile a prediction function.
 
         Parameters
         ----------
-        sigma : pytensor variable, float, or None
-            If provided, add sigma^2 to the predictive variance / covariance diagonal,
-            producing the posterior over y. If None, return the posterior over f.
         diag : bool
             If True, compute only the diagonal of the predictive covariance (much cheaper).
+        include_noise : bool
+            If True (default), add the observation noise sigma^2 (from ``self.sigma``)
+            to the predictive variance / covariance, giving the posterior over y.
+            If False, return the posterior over f.
         """
+        model = pm.modelcontext(model)
         t = pt.tensor("t", shape=(None, self.input_dim))
 
         if diag:
             mu, cov = self.predict_diag(t)
-            if sigma is not None:
+            if include_noise:
+                sigma = self._get_sigma(model)
                 cov = cov + sigma**2
         else:
             mu, cov = self.predict(t)
-            if sigma is not None:
+            if include_noise:
+                sigma = self._get_sigma(model)
                 cov = cov + sigma**2 * pt.identity_like(cov)
 
-        with pm.modelcontext(model) as model:
+        with model:
             mu_value, cov_value = model.replace_rvs_by_values([mu, cov])
 
         inputs = pm.inputvars([mu_value, cov_value])
@@ -269,3 +285,51 @@ class WhitenedSVGP(SVGP):
         mean = mux + A.T @ mu_tilde
         variance = Kxx_diag - pt.sum(A**2, axis=0) + pt.sum(B**2, axis=0)
         return mean, variance
+
+    def unwhiten(self, idata, model=None):
+        """Add an ``untransformed_fit`` group to *idata* with the inducing-point
+        posterior in function space.
+
+        The whitened variational parameters (mu_tilde, L_tilde) are mapped back
+        through Lz (the Cholesky of Kzz evaluated at the fitted hyperparameters)::
+
+            inducing_mean = mu_z + Lz @ mu_tilde
+            inducing_std = sqrt(diag(Lz @ L_tilde @ L_tilde.T @ Lz.T))
+
+        Returns the (mutated) *idata* with the new group.
+        """
+        import xarray as xr
+
+        model = pm.modelcontext(model)
+        point = self.prediction_point(idata)
+
+        # Compile Lz and muz at the fitted hyperparams
+        muz_sym, Lz_sym = self._kzz_cholesky()
+        [muz_v, Lz_v] = model.replace_rvs_by_values([muz_sym, Lz_sym])
+        inputs = pm.inputvars([muz_v, Lz_v])
+        f = pytensor.function(inputs, [muz_v, Lz_v], on_unused_input="ignore")
+        input_names = {v.name for v in inputs}
+        muz_val, Lz_val = f(**{k: v for k, v in point.items() if k in input_names})
+
+        # Unpack whitened params
+        mu_tilde = point["variational_mean"]
+        L_tilde = pm.expand_packed_triangular(
+            self.n_inducing, pt.as_tensor(point["variational_cholesky"])
+        ).eval()
+
+        # Transform to function space
+        mu_u = muz_val + Lz_val @ mu_tilde
+        # diag(Lz L_tilde L_tilde.T Lz.T) = row-wise squared norms of Lz @ L_tilde
+        sd_u = np.sqrt(np.sum((Lz_val @ L_tilde) ** 2, axis=1))
+
+        z_dim = "inducing_points_dim_0"
+        ds = xr.Dataset(
+            {
+                "inducing_mean": xr.DataArray(mu_u, dims=[z_dim]),
+                "inducing_std": xr.DataArray(sd_u, dims=[z_dim]),
+            }
+        )
+        if hasattr(idata, "untransformed_fit"):
+            del idata.untransformed_fit
+        idata.add_groups(untransformed_fit=ds)
+        return idata

@@ -254,9 +254,11 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
             loss=float(loss_val),
             grad_norm=float(grad_norm),
         )
+        state["progress"].refresh()
 
     def stop():
         if state["progress"] is not None:
+            state["progress"].refresh()
             state["progress"].stop()
             state["progress"] = None
             state["task"] = None
@@ -335,7 +337,7 @@ def fit_jax(
     X_batch = pt.tensor("X_batch", shape=(batch_size, svgp.input_dim))
     y_batch = pt.tensor("y_batch", shape=(batch_size, 1))
 
-    loss = -svgp.elbo(X_batch, y_batch, n_data)
+    loss = -svgp.elbo(X_batch, y_batch, n_data, model=model)
     [loss_v] = model.replace_rvs_by_values([loss])
 
     value_vars = model.continuous_value_vars
@@ -456,7 +458,7 @@ def fit_mlx(
     X_batch = pt.tensor("X_batch", shape=(batch_size, svgp.input_dim))
     y_batch = pt.tensor("y_batch", shape=(batch_size, 1))
 
-    loss = -svgp.elbo(X_batch, y_batch, n_data)
+    loss = -svgp.elbo(X_batch, y_batch, n_data, model=model)
     [loss_v] = model.replace_rvs_by_values([loss])
     loss_v = rewrite_pregrad(loss_v)
 
