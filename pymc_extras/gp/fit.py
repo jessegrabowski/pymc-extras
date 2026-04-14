@@ -6,9 +6,16 @@ import optax
 import pymc as pm
 import pytensor
 import pytensor.tensor as pt
+import xarray as xr
 
 from pymc.pytensorf import rewrite_pregrad
 from pymc.sampling.jax import get_jaxified_graph
+from pymc.util import get_default_varnames
+
+from pymc_extras.inference.laplace_approx.idata import (
+    add_data_to_inference_data,
+    map_results_to_inference_data,
+)
 
 # Register PyTensor → MLX dispatch entries that are missing upstream. The
 # import-and-register is guarded so importing this module does not require mlx.
@@ -74,25 +81,141 @@ def _coerce_xy(X, y, input_dim, asarray):
     return X, y
 
 
-def _make_rich_progress(desc):
-    """Return a configured ``rich.progress.Progress`` for fit loops."""
+def _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history=None):
+    """Package SVGP fit results into an ``arviz.InferenceData``.
+
+    Mirrors the convention used by :func:`pymc_extras.inference.find_MAP`:
+
+    - ``posterior`` group: constrained (RV-space) point estimates with
+      ``chain``/``draw`` dims of size 1 each.
+    - ``unconstrained_posterior`` group: transformed (value-var-space) values.
+    - ``observed_data`` and ``constant_data``: pulled from the model.
+    - ``fit`` group: per-step ``loss_history`` and ``grad_norm`` arrays.
+
+    ``value_var_point`` is the ``{value_var_name: array}`` dict produced by the
+    inner SGD loop (jax/numpy/mlx scalars are all coerced via ``np.asarray``).
+    """
+    point = {k: np.asarray(v) for k, v in value_var_point.items()}
+
+    unobserved_vars = get_default_varnames(model.unobserved_value_vars, include_transformed=True)
+    f_unobs = model.compile_fn(unobserved_vars, mode="FAST_COMPILE", point_fn=True)
+    values = f_unobs(point)
+    optimized_point = {v.name: val for v, val in zip(unobserved_vars, values)}
+
+    idata = map_results_to_inference_data(optimized_point, model=model, include_transformed=True)
+    idata = add_data_to_inference_data(idata, progressbar=False, model=model)
+
+    fit_data = {
+        "loss_history": xr.DataArray(np.asarray(loss_history), dims=["step"]),
+    }
+    if grad_norm_history is not None:
+        fit_data["grad_norm"] = xr.DataArray(np.asarray(grad_norm_history), dims=["step"])
+    idata.add_groups(fit=xr.Dataset(fit_data))
+    return idata
+
+
+def _make_rich_progress(desc, *, disable=False):
+    """Return a PyMC-style ``ToggleableProgress`` table for fit loops.
+
+    The table uses column headers (``show_header=True``) and a ``SIMPLE_HEAD``
+    box style, matching PyMC's ``pm.sample`` / ``better-optimize`` progress bars.
+    """
+    from collections.abc import Iterable
+
+    from rich.box import SIMPLE_HEAD
     from rich.progress import (
         BarColumn,
-        MofNCompleteColumn,
         Progress,
         TextColumn,
         TimeElapsedColumn,
         TimeRemainingColumn,
     )
+    from rich.table import Column, Table
+    from rich.text import Text
 
-    return Progress(
-        TextColumn(f"[bold]{desc}"),
+    class _FieldColumn(TextColumn):
+        """Render a numeric task field with a column header."""
+
+        def __init__(self, field, header, fmt=".3f", style="cyan"):
+            super().__init__("", table_column=Column(header=header))
+            self._field = field
+            self._fmt = fmt
+            self._style = style
+
+        def render(self, task):
+            val = task.fields.get(self._field)
+            if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                return Text("—")
+            return Text(f"{val:{self._fmt}}", style=self._style)
+
+    class _StepColumn(TextColumn):
+        """Show current step (completed count) with a 'Step' header."""
+
+        def __init__(self):
+            super().__init__("", table_column=Column(header="Step"))
+
+        def render(self, task):
+            return Text(str(int(task.completed)))
+
+    class ToggleableProgress(Progress):
+        def __init__(self, *args, **kwargs):
+            self.is_enabled = kwargs.pop("disable", None) is not True
+            if self.is_enabled:
+                super().__init__(*args, **kwargs)
+
+        def __enter__(self):
+            if self.is_enabled:
+                self.start()
+            return self
+
+        def __exit__(self, *args):
+            if self.is_enabled:
+                super().__exit__(*args)
+
+        def add_task(self, *args, **kwargs):
+            if self.is_enabled:
+                return super().add_task(*args, **kwargs)
+            return None
+
+        def advance(self, task_id, advance=1):
+            if self.is_enabled:
+                super().advance(task_id, advance)
+
+        def update(self, task_id, **kwargs):
+            if self.is_enabled:
+                super().update(task_id, **kwargs)
+
+        def make_tasks_table(self, tasks: Iterable) -> Table:
+            table_columns = (
+                (Column(no_wrap=True) if isinstance(c, str) else c.get_table_column().copy())
+                for c in self.columns
+            )
+            table = Table(
+                *table_columns,
+                padding=(0, 1),
+                expand=self.expand,
+                show_header=True,
+                show_edge=True,
+                box=SIMPLE_HEAD,
+            )
+            for task in tasks:
+                if task.visible:
+                    table.add_row(
+                        *(
+                            c.format(task=task) if isinstance(c, str) else c(task)
+                            for c in self.columns
+                        )
+                    )
+            return table
+
+    return ToggleableProgress(
         BarColumn(),
-        MofNCompleteColumn(),
-        TextColumn("[cyan]loss={task.fields[loss]:.3f}[/cyan]"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TimeRemainingColumn(),
+        _StepColumn(),
+        _FieldColumn("loss", header="Loss"),
+        _FieldColumn("grad_norm", header="|Grad|"),
+        TimeRemainingColumn(table_column=Column(header="Remaining")),
+        TimeElapsedColumn(table_column=Column(header="Elapsed")),
+        disable=disable,
     )
 
 
@@ -111,19 +234,27 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
 
     state = {"progress": None, "task": None}
 
-    def _open_or_update(iter_num, loss_val):
+    def _open_or_update(iter_num, loss_val, grad_norm):
         if state["progress"] is None:
             state["progress"] = _make_rich_progress(desc)
             state["progress"].start()
             state["task"] = state["progress"].add_task(
-                desc, total=int(n_steps), loss=float(loss_val)
+                desc, total=int(n_steps), loss=float(loss_val), grad_norm=float(grad_norm)
             )
-        state["progress"].update(state["task"], completed=int(iter_num) + 1, loss=float(loss_val))
+        state["progress"].update(
+            state["task"],
+            completed=int(iter_num) + 1,
+            loss=float(loss_val),
+            grad_norm=float(grad_norm),
+        )
 
-    def _close(iter_num, loss_val):
+    def _close(iter_num, loss_val, grad_norm):
         if state["progress"] is not None:
             state["progress"].update(
-                state["task"], completed=int(iter_num) + 1, loss=float(loss_val)
+                state["task"],
+                completed=int(iter_num) + 1,
+                loss=float(loss_val),
+                grad_norm=float(grad_norm),
             )
             state["progress"].stop()
             state["progress"] = None
@@ -132,19 +263,21 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
     def decorator(body):
         def wrapped(carry, scan_input):
             iter_num = scan_input[0] if isinstance(scan_input, tuple) else scan_input
-            new_carry, loss_val = body(carry, scan_input)
+            new_carry, (loss_val, grad_norm) = body(carry, scan_input)
 
             jax.lax.cond(
                 ((iter_num % print_rate == 0) & (iter_num != n_steps - 1)),
-                lambda: jax.experimental.io_callback(_open_or_update, None, iter_num, loss_val),
+                lambda: jax.experimental.io_callback(
+                    _open_or_update, None, iter_num, loss_val, grad_norm
+                ),
                 lambda: None,
             )
             jax.lax.cond(
                 iter_num == n_steps - 1,
-                lambda: jax.experimental.io_callback(_close, None, iter_num, loss_val),
+                lambda: jax.experimental.io_callback(_close, None, iter_num, loss_val, grad_norm),
                 lambda: None,
             )
-            return new_carry, loss_val
+            return new_carry, (loss_val, grad_norm)
 
         return wrapped
 
@@ -194,10 +327,10 @@ def fit_jax(
 
     Returns
     -------
-    final_params : dict[str, jax.Array]
-        Final fitted values, keyed by value-variable name.
-    loss_history : jax.Array, shape (n_steps,)
-        Negative ELBO at each step (pre-update).
+    idata : az.InferenceData
+        ``posterior`` (constrained), ``unconstrained_posterior`` (value-var
+        space), ``observed_data``, ``constant_data``, plus a ``fit`` group with
+        the per-step ``loss_history``.
     """
     model = pm.modelcontext(model)
 
@@ -227,6 +360,9 @@ def fit_jax(
     opt_state = optimizer.init(init_params)
     keys = jr.split(jr.PRNGKey(seed), n_steps)
 
+    def _grad_norm(grads):
+        return jnp.sqrt(sum(jnp.sum(g**2) for g in grads))
+
     def step(carry, scan_input):
         # scan_input is (iter_num, key) when progress=True, else just key
         key = scan_input[1] if isinstance(scan_input, tuple) else scan_input
@@ -235,9 +371,10 @@ def fit_jax(
         X_b = X_data[idx]
         y_b = y_data[idx]
         loss_val, grads = jax.value_and_grad(f_loss)(params, X_b, y_b)
+        grad_norm = _grad_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        return (params, opt_state), loss_val
+        return (params, opt_state), (loss_val, grad_norm)
 
     if progress:
         body = _scan_progress_bar(n_steps, print_rate=print_rate)(step)
@@ -246,9 +383,12 @@ def fit_jax(
         body = step
         scan_inputs = keys
 
-    (final_params, _), loss_history = jax.lax.scan(body, (init_params, opt_state), scan_inputs)
+    (final_params, _), (loss_history, grad_norm_history) = jax.lax.scan(
+        body, (init_params, opt_state), scan_inputs
+    )
 
-    return dict(zip(var_names, final_params)), loss_history
+    value_var_point = dict(zip(var_names, final_params))
+    return _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history)
 
 
 def fit_mlx(
@@ -299,10 +439,10 @@ def fit_mlx(
 
     Returns
     -------
-    final_params : dict[str, np.ndarray]
-        Final fitted values, keyed by value-variable name.
-    loss_history : np.ndarray, shape (n_steps,)
-        Negative ELBO at each step (pre-update).
+    idata : az.InferenceData
+        ``posterior`` (constrained), ``unconstrained_posterior`` (value-var
+        space), ``observed_data``, ``constant_data``, plus a ``fit`` group with
+        the per-step ``loss_history``.
     """
     try:
         import mlx.core as mx
@@ -342,6 +482,7 @@ def fit_mlx(
 
     rng = np.random.default_rng(seed)
     loss_history = np.empty(n_steps, dtype=np.float64)
+    grad_norm_history = np.empty(n_steps, dtype=np.float64)
 
     if print_rate is None:
         print_rate = max(1, n_steps // 100)
@@ -350,7 +491,9 @@ def fit_mlx(
     task = None
     if progress_obj is not None:
         progress_obj.start()
-        task = progress_obj.add_task("fit_mlx", total=n_steps, loss=float("nan"))
+        task = progress_obj.add_task(
+            "fit_mlx", total=n_steps, loss=float("nan"), grad_norm=float("nan")
+        )
 
     try:
         for step in range(n_steps):
@@ -358,15 +501,17 @@ def fit_mlx(
             X_b = X_data[idx]
             y_b = y_data[idx]
             loss_val, *grad_vals = f_value_and_grad(X_b, y_b, *(params[name] for name in var_names))
-            grads = dict(zip(var_names, grad_vals))
-            params = optimizer.apply_gradients(grads, params)
+            gn = float(np.linalg.norm(np.concatenate([np.asarray(g).ravel() for g in grad_vals])))
+            grads_dict = dict(zip(var_names, grad_vals))
+            params = optimizer.apply_gradients(grads_dict, params)
             loss_history[step] = float(loss_val)
+            grad_norm_history[step] = gn
 
             if progress_obj is not None and (step % print_rate == 0 or step == n_steps - 1):
-                progress_obj.update(task, completed=step + 1, loss=loss_history[step])
+                progress_obj.update(task, completed=step + 1, loss=loss_history[step], grad_norm=gn)
     finally:
         if progress_obj is not None:
             progress_obj.stop()
 
-    final_params = {name: np.asarray(params[name]) for name in var_names}
-    return final_params, loss_history
+    value_var_point = {name: np.asarray(params[name]) for name in var_names}
+    return _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history)

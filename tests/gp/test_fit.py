@@ -30,7 +30,7 @@ def test_fit_jax_reduces_loss_on_regression(cls):
         )
 
     optimizer = optax.adam(learning_rate=1e-2)
-    final_params, history = fit_jax(
+    idata = fit_jax(
         svgp,
         X,
         y,
@@ -39,19 +39,17 @@ def test_fit_jax_reduces_loss_on_regression(cls):
         batch_size=32,
         model=model,
         seed=0,
+        progress=False,
     )
 
-    history = np.asarray(history)
+    history = np.asarray(idata.fit.loss_history)
     assert history.shape == (200,)
     assert np.isfinite(history).all()
-    # First 10 steps avg vs last 10 steps avg — loss should drop substantively.
     assert history[-10:].mean() < history[:10].mean() - 1.0
 
-    # Returned params dict has expected keys and finite values.
-    assert set(final_params).issuperset({"z", "variational_mean", "vrc"})
-    for name, val in final_params.items():
-        val = np.asarray(val)
-        assert np.isfinite(val).all(), f"non-finite values in {name}"
+    assert "z" in idata.posterior.data_vars
+    assert "variational_mean" in idata.posterior.data_vars
+    assert "vrc" in idata.posterior.data_vars
 
 
 def test_fit_jax_respects_init_params():
@@ -75,15 +73,11 @@ def test_fit_jax_respects_init_params():
         )
 
     var_names = [v.name for v in model.continuous_value_vars]
-    # Perturb the default initial point to a recognizable custom value. Don't zero
-    # out vrc — that's a singular Cholesky factor and the loss is -inf there.
     init_pt = model.initial_point()
     custom_init = tuple(jnp.asarray(init_pt[name]) + 0.1 for name in var_names)
 
-    # n_steps=0 isn't a thing with scan (length must be > 0); use 1 step with very
-    # small lr so the result is essentially the init.
     optimizer = optax.sgd(learning_rate=1e-12)
-    final_params, _ = fit_jax(
+    idata = fit_jax(
         svgp,
         X,
         y,
@@ -93,10 +87,49 @@ def test_fit_jax_respects_init_params():
         model=model,
         init_params=custom_init,
         seed=0,
+        progress=False,
     )
 
+    # After 1 step at lr=1e-12, params should be ~unchanged from custom_init.
+    # This model has no transforms, so all value vars live in posterior directly.
     for name, init in zip(var_names, custom_init):
-        np.testing.assert_allclose(np.asarray(final_params[name]), np.asarray(init), atol=1e-6)
+        fitted = idata.posterior[name].values.squeeze()
+        np.testing.assert_allclose(fitted, np.asarray(init).squeeze(), atol=1e-5)
+
+
+def test_fit_jax_returns_idata_with_hyperparams():
+    """fit_jax should return constrained hyperparams (sigma, etc.) in posterior."""
+    rng = np.random.default_rng(0)
+    X = rng.uniform(-3, 3, size=(200, 1))
+    y = np.sin(X) + 0.1 * rng.normal(size=(200, 1))
+
+    with pm.Model() as model:
+        sigma = pm.Exponential("sigma", scale=1.0)
+        svgp = WhitenedSVGP(
+            input_dim=1,
+            n_data=200,
+            mean_func=pm.gp.mean.Zero(),
+            cov_func=pm.gp.cov.ExpQuad(1, ls=1.0),
+            sigma=sigma,
+            z_init=np.linspace(-3, 3, 8).reshape(-1, 1),
+        )
+
+    idata = fit_jax(
+        svgp,
+        X,
+        y,
+        optimizer=optax.adam(1e-2),
+        n_steps=200,
+        batch_size=32,
+        model=model,
+        progress=False,
+    )
+
+    assert "sigma" in idata.posterior.data_vars
+    assert "sigma_log__" in idata.unconstrained_posterior.data_vars
+    sigma_val = float(idata.posterior["sigma"].squeeze())
+    assert sigma_val > 0  # constrained space is positive
+    assert sigma_val != 1.0  # should have moved from the init
 
 
 def test_fit_mlx_reduces_loss_on_regression():
@@ -130,11 +163,22 @@ def test_fit_mlx_reduces_loss_on_regression():
             )
 
         opt = mlx_opt.Adam(learning_rate=1e-3)
-        final, hist = fit_mlx(svgp, X, y, optimizer=opt, n_steps=200, batch_size=32, model=model)
+        idata = fit_mlx(
+            svgp,
+            X,
+            y,
+            optimizer=opt,
+            n_steps=200,
+            batch_size=32,
+            model=model,
+            progress=False,
+        )
     finally:
         pytensor.config.floatX = prev_floatX
 
-    assert hist.shape == (200,)
-    assert np.isfinite(hist).all()
-    assert hist[-10:].mean() < hist[:10].mean() - 1.0
-    assert set(final).issuperset({"z", "variational_mean", "vrc"})
+    history = np.asarray(idata.fit.loss_history)
+    assert history.shape == (200,)
+    assert np.isfinite(history).all()
+    assert history[-10:].mean() < history[:10].mean() - 1.0
+    assert "z" in idata.posterior.data_vars
+    assert "variational_mean" in idata.posterior.data_vars
