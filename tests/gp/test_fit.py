@@ -21,8 +21,6 @@ def test_fit_jax_reduces_loss_on_regression(cls):
 
     with pm.Model() as model:
         svgp = cls(
-            input_dim=input_dim,
-            n_data=n_data,
             mean_func=pm.gp.mean.Zero(),
             cov_func=pm.gp.cov.ExpQuad(input_dim=input_dim, ls=1.0),
             sigma=0.1,
@@ -47,9 +45,9 @@ def test_fit_jax_reduces_loss_on_regression(cls):
     assert np.isfinite(history).all()
     assert history[-10:].mean() < history[:10].mean() - 1.0
 
-    assert "z" in idata.posterior.data_vars
-    assert "variational_mean" in idata.posterior.data_vars
-    assert "vrc" in idata.posterior.data_vars
+    assert "inducing_points" in idata.fit.data_vars
+    assert "variational_mean" in idata.fit.data_vars
+    assert "variational_cholesky" in idata.fit.data_vars
 
 
 def test_fit_jax_respects_init_params():
@@ -64,8 +62,6 @@ def test_fit_jax_respects_init_params():
 
     with pm.Model() as model:
         svgp = SVGP(
-            input_dim=input_dim,
-            n_data=n_data,
             mean_func=pm.gp.mean.Zero(),
             cov_func=pm.gp.cov.ExpQuad(input_dim=input_dim, ls=1.0),
             sigma=0.1,
@@ -91,10 +87,12 @@ def test_fit_jax_respects_init_params():
     )
 
     # After 1 step at lr=1e-12, params should be ~unchanged from custom_init.
-    # This model has no transforms, so all value vars live in posterior directly.
+    # SVGP internals are in idata.fit; user params would be in idata.posterior.
+    pred_point = svgp.prediction_point(idata)
     for name, init in zip(var_names, custom_init):
-        fitted = idata.posterior[name].values.squeeze()
-        np.testing.assert_allclose(fitted, np.asarray(init).squeeze(), atol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(pred_point[name]).squeeze(), np.asarray(init).squeeze(), atol=1e-5
+        )
 
 
 def test_fit_jax_returns_idata_with_hyperparams():
@@ -106,8 +104,6 @@ def test_fit_jax_returns_idata_with_hyperparams():
     with pm.Model() as model:
         sigma = pm.Exponential("sigma", scale=1.0)
         svgp = WhitenedSVGP(
-            input_dim=1,
-            n_data=200,
             mean_func=pm.gp.mean.Zero(),
             cov_func=pm.gp.cov.ExpQuad(1, ls=1.0),
             sigma=sigma,
@@ -154,8 +150,6 @@ def test_fit_mlx_reduces_loss_on_regression():
     try:
         with pm.Model() as model:
             svgp = WhitenedSVGP(
-                input_dim=input_dim,
-                n_data=n_data,
                 mean_func=pm.gp.mean.Zero(),
                 cov_func=pm.gp.cov.ExpQuad(input_dim, ls=1.0),
                 sigma=0.1,
@@ -180,5 +174,5 @@ def test_fit_mlx_reduces_loss_on_regression():
     assert history.shape == (200,)
     assert np.isfinite(history).all()
     assert history[-10:].mean() < history[:10].mean() - 1.0
-    assert "z" in idata.posterior.data_vars
-    assert "variational_mean" in idata.posterior.data_vars
+    assert "inducing_points" in idata.fit.data_vars
+    assert "variational_mean" in idata.fit.data_vars

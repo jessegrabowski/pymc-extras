@@ -56,14 +56,12 @@ def _rbf(a, b, ls):
     return np.exp(-0.5 * sqd / ls**2)
 
 
-def _build_svgp(problem, cls=SVGP, sigma=0.1, n_data=100):
+def _build_svgp(problem, cls=SVGP, sigma=0.1):
     kernel = pm.gp.cov.ExpQuad(input_dim=problem["input_dim"], ls=problem["ls"])
     mean_fn = pm.gp.mean.Zero()
     model = pm.Model()
     with model:
         svgp = cls(
-            input_dim=problem["input_dim"],
-            n_data=n_data,
             mean_func=mean_fn,
             cov_func=kernel,
             sigma=sigma,
@@ -75,9 +73,9 @@ def _build_svgp(problem, cls=SVGP, sigma=0.1, n_data=100):
 def _point(problem):
     n = problem["n_inducing"]
     return {
-        "z": problem["z"],
+        "inducing_points": problem["z"],
         "variational_mean": problem["mu_q"],
-        "vrc": problem["L_q"][np.tril_indices(n)],
+        "variational_cholesky": problem["L_q"][np.tril_indices(n)],
     }
 
 
@@ -151,7 +149,7 @@ def test_predict_diag_matches_full_predict_diagonal(problem):
 
 
 def test_variational_expectation_matches_closed_form(problem):
-    # Reference: -0.5 * (log(2π) + log(σ²) + ((y − m)² + v) / σ²)  per-point
+    # Reference: -0.5 * (log(2pi) + log(sigma^2) + ((y - m)^2 + v) / sigma^2)
     sigma = 0.3
     svgp, model = _build_svgp(problem, sigma=sigma)
 
@@ -177,7 +175,7 @@ def test_variational_expectation_matches_closed_form(problem):
 def test_elbo_equals_scaled_varexp_minus_kl(problem):
     sigma = 0.3
     n_data = 500
-    svgp, model = _build_svgp(problem, sigma=sigma, n_data=n_data)
+    svgp, model = _build_svgp(problem, sigma=sigma)
 
     t_const = pt.as_tensor_variable(problem["t"])
     y_const = pt.as_tensor_variable(problem["y"])
@@ -185,7 +183,7 @@ def test_elbo_equals_scaled_varexp_minus_kl(problem):
     with model:
         ve = svgp.variational_expectation(t_const, y_const)
         kl = svgp.kl_divergence()
-        elbo = svgp.elbo(t_const, y_const)
+        elbo = svgp.elbo(t_const, y_const, n_data)
 
     point = _point(problem)
     ve_val = _eval(ve, model, point)
@@ -198,14 +196,14 @@ def test_elbo_equals_scaled_varexp_minus_kl(problem):
 
 # -- Whitened parameterization --------------------------------------------------
 #
-# In the whitened parameterization, ``q(v) = N(μ̃, L̃ L̃ᵀ)`` over
-# ``v = L_z⁻¹ (u − μ_z)``. Setting μ̃ = L_z⁻¹ (μ_q − μ_z) and L̃ = L_z⁻¹ L_q
-# gives an equivalent ``q(u)`` to the unwhitened SVGP with parameters (μ_q, L_q),
+# In the whitened parameterization, q(v) = N(mu_tilde, L_tilde L_tilde.T) over
+# v = Lz^-1 (u - mu_z). Setting mu_tilde = Lz^-1 mu_q and L_tilde = Lz^-1 L_q
+# gives an equivalent q(u) to the unwhitened SVGP with parameters (mu_q, L_q),
 # and the predictive distributions agree exactly.
 
 
 def _whitened_equivalents(problem):
-    """μ̃, L̃ that make WhitenedSVGP match the SVGP fixture's q(u)."""
+    """mu_tilde, L_tilde that make WhitenedSVGP match the SVGP fixture's q(u)."""
     Lz = problem["Lz"]
     mu_q = problem["mu_q"]
     L_q = problem["L_q"]
@@ -218,9 +216,9 @@ def _whitened_point(problem):
     n = problem["n_inducing"]
     mu_tilde, L_tilde = _whitened_equivalents(problem)
     return {
-        "z": problem["z"],
+        "inducing_points": problem["z"],
         "variational_mean": mu_tilde,
-        "vrc": L_tilde[np.tril_indices(n)],
+        "variational_cholesky": L_tilde[np.tril_indices(n)],
     }
 
 
@@ -240,8 +238,8 @@ def test_whitened_kl_matches_closed_form(problem):
 
 
 def test_whitened_predict_matches_unwhitened_with_equivalent_params(problem):
-    """Whitened (μ̃, L̃) should give the same predictive distribution as
-    unwhitened (μ_q, L_q) when (μ̃, L̃) are the whitened transforms of (μ_q, L_q)."""
+    """Whitened (mu_tilde, L_tilde) should give the same predictive distribution
+    as unwhitened (mu_q, L_q) when the whitened params are the transforms."""
     t_const = pt.as_tensor_variable(problem["t"])
 
     # Unwhitened reference

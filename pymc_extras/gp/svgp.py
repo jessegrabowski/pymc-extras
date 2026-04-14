@@ -11,15 +11,13 @@ from pymc.gp.util import stabilize
 class SVGP:
     """Sparse variational Gaussian process.
 
-    This class only builds PyTensor graphs — ELBO, KL, predictive mean/covariance.
+    This class only builds PyTensor graphs --ELBO, KL, predictive mean/covariance.
     Minibatching, optimizer choice, backend selection, and the training loop are
     the user's responsibility.
     """
 
     def __init__(
         self,
-        input_dim,
-        n_data,
         mean_func,
         cov_func,
         sigma,
@@ -31,11 +29,9 @@ class SVGP:
         self.sigma = sigma
         self.jitter = jitter
 
-        self.input_dim = input_dim
-        self.n_inducing = z_init.shape[0]
-        self.n_data = n_data
-
         self.z_init = z_init
+        self.n_inducing = z_init.shape[0]
+        self.input_dim = z_init.shape[1]
 
         self.initialize()
 
@@ -51,9 +47,9 @@ class SVGP:
         z_init = np.asarray(self.z_init, dtype=floatX)
 
         with pm.modelcontext(model):
-            self.z = pm.Flat("z", shape=(n, self.input_dim), initval=z_init)
+            self.z = pm.Flat("inducing_points", shape=(n, self.input_dim), initval=z_init)
             self.variational_mean = pm.Flat("variational_mean", shape=n, initval=mean_init)
-            vrc_packed = pm.Flat("vrc", shape=n * (n + 1) // 2, initval=vrc_init)
+            vrc_packed = pm.Flat("variational_cholesky", shape=n * (n + 1) // 2, initval=vrc_init)
             # Lower-triangular Cholesky root L such that Cov(q(u)) = L @ L.T.
             self.variational_root_covariance = pm.expand_packed_triangular(n, vrc_packed)
 
@@ -69,11 +65,11 @@ class SVGP:
 
     @staticmethod
     def kl_mvn_chol(mu_q, L_q, mu_p, L_p):
-        """KL[ N(mu_q, L_q L_qᵀ) || N(mu_p, L_p L_pᵀ) ]."""
+        """KL[ N(mu_q, L_q L_q.T) || N(mu_p, L_p L_p.T) ]."""
         d = mu_p - mu_q
-        # tr(K_p⁻¹ K_q) = ‖L_p⁻¹ L_q‖_F²
+        # tr(Kp^-1 Kq) = ||Lp^-1 Lq||_F^2
         M = pt.linalg.solve_triangular(L_p, L_q, lower=True)
-        # (μ_p − μ_q)ᵀ K_p⁻¹ (μ_p − μ_q) = ‖L_p⁻¹ d‖²
+        # (mu_p - mu_q).T Kp^-1 (mu_p - mu_q) = ||Lp^-1 d||^2
         v = pt.linalg.solve_triangular(L_p, d, lower=True)
         trace = pt.sum(M**2)
         mahalanobis = pt.sum(v**2)
@@ -101,7 +97,7 @@ class SVGP:
         return mean, covariance
 
     def predict_diag(self, X):
-        """Variational posterior over f(X). Returns (mean, variance) — only the diagonal.
+        """Variational posterior over f(X). Returns (mean, variance) --only the diagonal.
 
         Shares one Kzz Cholesky across the whole batch rather than vectorizing per-point.
         """
@@ -129,10 +125,10 @@ class SVGP:
         log_sigma2 = 2.0 * pt.log(self.sigma)
         return -0.5 * (log_two_pi + log_sigma2 + (sq_error + variance) / self.sigma**2)
 
-    def elbo(self, X_batch, y_batch):
+    def elbo(self, X_batch, y_batch, n_data):
         var_exp = self.variational_expectation(X_batch, y_batch)
         batch_size = y_batch.shape[0]
-        return (self.n_data / batch_size) * pt.sum(var_exp) - self.kl_divergence()
+        return (n_data / batch_size) * pt.sum(var_exp) - self.kl_divergence()
 
     def compile_pred_func(self, sigma=None, diag=False, mode="FAST_RUN", model=None):
         """Compile a prediction function.
@@ -140,7 +136,7 @@ class SVGP:
         Parameters
         ----------
         sigma : pytensor variable, float, or None
-            If provided, add sigma² to the predictive variance / covariance diagonal,
+            If provided, add sigma^2 to the predictive variance / covariance diagonal,
             producing the posterior over y. If None, return the posterior over f.
         diag : bool
             If True, compute only the diagonal of the predictive covariance (much cheaper).
@@ -172,7 +168,33 @@ class SVGP:
             f_predict=f_predict,
         )
 
+    _internal_rv_names = {"inducing_points", "variational_mean", "variational_cholesky"}
+
+    def prediction_point(self, idata):
+        """Extract a value-var dict from an InferenceData for use with ``compile_pred_func``.
+
+        Combines the unconstrained hyperparameters from ``idata.unconstrained_posterior``
+        with the SVGP internals from ``idata.fit``, keyed by the value-variable names
+        that the compiled prediction function expects.
+        """
+        result = {}
+        if hasattr(idata, "unconstrained_posterior"):
+            for name in idata.unconstrained_posterior.data_vars:
+                result[name] = idata.unconstrained_posterior[name].values.squeeze()
+        if hasattr(idata, "posterior"):
+            for name in idata.posterior.data_vars:
+                if name not in result:
+                    result[name] = idata.posterior[name].values.squeeze()
+        for name in self._internal_rv_names:
+            if name in idata.fit.data_vars:
+                result[name] = np.asarray(idata.fit[name])
+        return result
+
     def _predict_f(self, X_pred, result_dict, inputs, f_predict):
+        import arviz as az
+
+        if isinstance(result_dict, az.InferenceData):
+            result_dict = self.prediction_point(result_dict)
         input_names = [x.name for x in inputs]
         mu_pred, cov_pred = f_predict(
             **{k: v for k, v in result_dict.items() if k in input_names}, t=X_pred
@@ -181,32 +203,32 @@ class SVGP:
 
 
 class WhitenedSVGP(SVGP):
-    r"""SVGP with the whitened parameterization.
+    """SVGP with the whitened parameterization.
 
-    Instead of parameterizing ``q(u) = N(μ_q, L_q L_qᵀ)`` directly over the
-    inducing values ``u = f(z)``, parameterize the whitened variables
-    ``v = L_z⁻¹ (u − μ_z)`` as ``q(v) = N(μ̃, L̃ L̃ᵀ)``. Under the prior,
-    ``v ~ N(0, I)``.
+    Instead of parameterizing q(u) = N(mu_q, L_q L_q.T) directly over the
+    inducing values u = f(z), parameterize the whitened variables
+    v = Lz^-1 (u - mu_z) as q(v) = N(mu_tilde, L_tilde L_tilde.T). Under
+    the prior, v ~ N(0, I).
 
     Advantages over :class:`SVGP`:
 
-    - ``KL[q(v) ‖ p(v)] = KL[N(μ̃, L̃ L̃ᵀ) ‖ N(0, I)]`` — no ``K_zz`` inversion
-      and no Cholesky of ``K_zz`` in the KL computation.
-    - The optimal variational distribution over ``v`` does not depend on
-      ``K_zz``, so optimizer conditioning is dramatically better when kernel
+    - KL[q(v) || p(v)] = KL[N(mu_tilde, S_tilde) || N(0, I)] -- no Kzz
+      inversion and no Cholesky of Kzz in the KL computation.
+    - The optimal variational distribution over v does not depend on Kzz,
+      so optimizer conditioning is dramatically better when kernel
       hyperparameters are learned jointly.
-    - One fewer triangular solve per predictive call (only ``L_z⁻¹ K_zt``; no
-      separate ``K_zz⁻¹ K_zt``).
+    - One fewer triangular solve per predictive call (only Lz^-1 Kzt; no
+      separate Kzz^-1 Kzt).
 
-    ``self.variational_mean`` and ``self.variational_root_covariance`` now
-    represent ``μ̃`` and ``L̃`` rather than ``μ_q`` and ``L_q``.
+    ``self.variational_mean`` and ``self.variational_root_covariance`` represent
+    mu_tilde and L_tilde rather than mu_q and L_q.
     """
 
     def kl_divergence(self):
         mu_tilde = self.variational_mean
         L_tilde = self.variational_root_covariance
         m = mu_tilde.shape[0]
-        # tr(L̃ L̃ᵀ) = ‖L̃‖_F²
+        # tr(L_tilde L_tilde.T) = ||L_tilde||_F^2
         trace = pt.sum(L_tilde**2)
         mahalanobis = pt.sum(mu_tilde**2)
         logdet_q = 2.0 * pt.sum(pt.log(pt.diag(L_tilde)))
@@ -222,9 +244,9 @@ class WhitenedSVGP(SVGP):
         Kzt = self.cov_func(self.z, t)
         Ktt = self.cov_func(t)
 
-        # A = L_z⁻¹ K_zt,  shape (M, T)
+        # A = Lz^-1 Kzt,  shape (M, T)
         A = pt.linalg.solve_triangular(Lz, Kzt, lower=True)
-        # L̃ᵀ A,  shape (M, T)
+        # L_tilde.T @ A,  shape (M, T)
         B = L_tilde.T @ A
 
         mean = mut + A.T @ mu_tilde
@@ -232,7 +254,7 @@ class WhitenedSVGP(SVGP):
         return mean, covariance
 
     def predict_diag(self, X):
-        """Variational posterior over f(X). Returns (mean, variance) — only the diagonal."""
+        """Variational posterior over f(X). Returns (mean, variance) -- only the diagonal."""
         mu_tilde = self.variational_mean
         L_tilde = self.variational_root_covariance
 

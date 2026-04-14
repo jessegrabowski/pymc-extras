@@ -81,28 +81,30 @@ def _coerce_xy(X, y, input_dim, asarray):
     return X, y
 
 
-def _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history=None):
+def _fit_results_to_idata(model, svgp, value_var_point, loss_history, grad_norm_history=None):
     """Package SVGP fit results into an ``arviz.InferenceData``.
 
-    Mirrors the convention used by :func:`pymc_extras.inference.find_MAP`:
-
-    - ``posterior`` group: constrained (RV-space) point estimates with
-      ``chain``/``draw`` dims of size 1 each.
-    - ``unconstrained_posterior`` group: transformed (value-var-space) values.
+    - ``posterior`` group: user-defined model parameters only (sigma, eta, ell, …).
+      SVGP internals (inducing points, variational params) are excluded.
+    - ``unconstrained_posterior`` group: transformed (value-var-space) values for
+      the user-defined params.
     - ``observed_data`` and ``constant_data``: pulled from the model.
-    - ``fit`` group: per-step ``loss_history`` and ``grad_norm`` arrays.
-
-    ``value_var_point`` is the ``{value_var_name: array}`` dict produced by the
-    inner SGD loop (jax/numpy/mlx scalars are all coerced via ``np.asarray``).
+    - ``fit`` group: per-step ``loss_history``, ``grad_norm``, plus the SVGP
+      internal state (``inducing_points``, ``variational_mean``,
+      ``variational_cholesky``) needed to reconstruct predictions.
     """
     point = {k: np.asarray(v) for k, v in value_var_point.items()}
+    internal_names = svgp._internal_rv_names
 
     unobserved_vars = get_default_varnames(model.unobserved_value_vars, include_transformed=True)
     f_unobs = model.compile_fn(unobserved_vars, mode="FAST_COMPILE", point_fn=True)
     values = f_unobs(point)
     optimized_point = {v.name: val for v, val in zip(unobserved_vars, values)}
 
-    idata = map_results_to_inference_data(optimized_point, model=model, include_transformed=True)
+    # Split: user params go to posterior; SVGP internals go to fit group.
+    user_point = {k: v for k, v in optimized_point.items() if k not in internal_names}
+
+    idata = map_results_to_inference_data(user_point, model=model, include_transformed=True)
     idata = add_data_to_inference_data(idata, progressbar=False, model=model)
 
     fit_data = {
@@ -110,6 +112,11 @@ def _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_histor
     }
     if grad_norm_history is not None:
         fit_data["grad_norm"] = xr.DataArray(np.asarray(grad_norm_history), dims=["step"])
+    for name in internal_names:
+        if name in optimized_point:
+            arr = np.asarray(optimized_point[name])
+            dims = [f"{name}_dim_{i}" for i in range(arr.ndim)]
+            fit_data[name] = xr.DataArray(arr, dims=dims)
     idata.add_groups(fit=xr.Dataset(fit_data))
     return idata
 
@@ -234,7 +241,7 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
 
     state = {"progress": None, "task": None}
 
-    def _open_or_update(iter_num, loss_val, grad_norm):
+    def _update(iter_num, loss_val, grad_norm):
         if state["progress"] is None:
             state["progress"] = _make_rich_progress(desc)
             state["progress"].start()
@@ -248,14 +255,8 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
             grad_norm=float(grad_norm),
         )
 
-    def _close(iter_num, loss_val, grad_norm):
+    def stop():
         if state["progress"] is not None:
-            state["progress"].update(
-                state["task"],
-                completed=int(iter_num) + 1,
-                loss=float(loss_val),
-                grad_norm=float(grad_norm),
-            )
             state["progress"].stop()
             state["progress"] = None
             state["task"] = None
@@ -266,19 +267,13 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
             new_carry, (loss_val, grad_norm) = body(carry, scan_input)
 
             jax.lax.cond(
-                ((iter_num % print_rate == 0) & (iter_num != n_steps - 1)),
-                lambda: jax.experimental.io_callback(
-                    _open_or_update, None, iter_num, loss_val, grad_norm
-                ),
-                lambda: None,
-            )
-            jax.lax.cond(
-                iter_num == n_steps - 1,
-                lambda: jax.experimental.io_callback(_close, None, iter_num, loss_val, grad_norm),
+                (iter_num % print_rate == 0) | (iter_num == n_steps - 1),
+                lambda: jax.experimental.io_callback(_update, None, iter_num, loss_val, grad_norm),
                 lambda: None,
             )
             return new_carry, (loss_val, grad_norm)
 
+        wrapped.stop = stop
         return wrapped
 
     return decorator
@@ -340,7 +335,7 @@ def fit_jax(
     X_batch = pt.tensor("X_batch", shape=(batch_size, svgp.input_dim))
     y_batch = pt.tensor("y_batch", shape=(batch_size, 1))
 
-    loss = -svgp.elbo(X_batch, y_batch)
+    loss = -svgp.elbo(X_batch, y_batch, n_data)
     [loss_v] = model.replace_rvs_by_values([loss])
 
     value_vars = model.continuous_value_vars
@@ -386,9 +381,11 @@ def fit_jax(
     (final_params, _), (loss_history, grad_norm_history) = jax.lax.scan(
         body, (init_params, opt_state), scan_inputs
     )
+    if hasattr(body, "stop"):
+        body.stop()
 
     value_var_point = dict(zip(var_names, final_params))
-    return _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history)
+    return _fit_results_to_idata(model, svgp, value_var_point, loss_history, grad_norm_history)
 
 
 def fit_mlx(
@@ -459,7 +456,7 @@ def fit_mlx(
     X_batch = pt.tensor("X_batch", shape=(batch_size, svgp.input_dim))
     y_batch = pt.tensor("y_batch", shape=(batch_size, 1))
 
-    loss = -svgp.elbo(X_batch, y_batch)
+    loss = -svgp.elbo(X_batch, y_batch, n_data)
     [loss_v] = model.replace_rvs_by_values([loss])
     loss_v = rewrite_pregrad(loss_v)
 
@@ -514,4 +511,4 @@ def fit_mlx(
             progress_obj.stop()
 
     value_var_point = {name: np.asarray(params[name]) for name in var_names}
-    return _fit_results_to_idata(model, value_var_point, loss_history, grad_norm_history)
+    return _fit_results_to_idata(model, svgp, value_var_point, loss_history, grad_norm_history)
