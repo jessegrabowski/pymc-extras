@@ -271,7 +271,7 @@ def _scan_progress_bar(n_steps, print_rate=None, desc="fit_jax"):
             new_carry, (loss_val, grad_norm) = body(carry, scan_input)
 
             jax.lax.cond(
-                (iter_num % print_rate == 0) | (iter_num == n_steps - 1),
+                ((iter_num > 0) & (iter_num % print_rate == 0)) | (iter_num == n_steps - 1),
                 lambda: jax.experimental.io_callback(_update, None, iter_num, loss_val, grad_norm),
                 lambda: None,
             )
