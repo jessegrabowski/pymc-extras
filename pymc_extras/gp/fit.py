@@ -151,8 +151,10 @@ def _make_rich_progress(desc, *, disable=False):
 
         def render(self, task):
             val = task.fields.get(self._field)
-            if val is None or (isinstance(val, float) and not np.isfinite(val)):
-                return Text("—")
+            if val is None:
+                return Text("--")
+            if isinstance(val, float) and not np.isfinite(val):
+                return Text("nan", style="bold red")
             return Text(f"{val:{self._fmt}}", style=self._style)
 
     class _StepColumn(TextColumn):
