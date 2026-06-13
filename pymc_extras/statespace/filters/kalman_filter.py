@@ -879,8 +879,10 @@ class ConvergentFilter(StandardFilter):
       rejected. For :class:`SharedVariable` or :class:`TensorConstant` data the check runs at build
       time; fully symbolic data gets an :class:`~pytensor.raise_op.Assert` that fires at runtime.
 
-    Only ``d loglike_obs`` is supported as an upstream gradient; other output adjoints are treated as
-    disconnected. For gradients of other filter outputs, use :class:`StandardFilter`.
+    Only ``d loglike_obs`` is supported as an upstream gradient, and it must carry a uniform per-step
+    weight (the standard ``loglike_obs.sum()`` loss); other output adjoints are treated as disconnected
+    and per-observation weighting raises. For gradients of other filter outputs, or weighted
+    likelihoods, use :class:`StandardFilter`.
 
     Parameters
     ----------
@@ -892,6 +894,13 @@ class ConvergentFilter(StandardFilter):
     _MISSING_DATA_MSG = (
         "ConvergentFilter does not support missing data in the observation series. "
         "Use StandardFilter for data with missing values."
+    )
+
+    _NONUNIFORM_LL_MSG = (
+        "ConvergentFilter's analytic gradient assumes a uniform per-timestep weight on the "
+        "log-likelihood (the standard loss = loglike_obs.sum()). The upstream gradient on "
+        "loglike_obs varies across timesteps, which indicates per-observation weighting; this "
+        "is not supported. Use StandardFilter."
     )
 
     def __init__(self, tol: float = 1e-10):
@@ -1209,10 +1218,14 @@ class ConvergentFilter(StandardFilter):
             data_tr, data_fx = data_[:k_sym], data_[k_sym:]
             a_star, P_star = a_hat_tr[-1], P_hat_tr[-1]
             a_hat_fx = a_hat_sym[k_sym:]
-            # Reduce the per-step ll adjoint to a scalar by averaging. This is correct for the
-            # standard use case loss = ll.sum() (dll is a broadcast of ones, average is 1.0) and
-            # punts on the more general case of per-step weights.
+            # Reduce the per-step ll adjoint to a scalar by averaging. Exact when every timestep
+            # carries the same upstream weight -- the standard loss = loglike_obs.sum(), where dll is
+            # constant (a broadcast of ones, average 1.0). A non-constant dll means per-observation
+            # weighting, which the analytic tail backward does not handle.
             dlogp_up = dll.sum() / dll.shape[0]
+            dlogp_up = Assert(filt_self._NONUNIFORM_LL_MSG)(
+                dlogp_up, pt.all(pt.isclose(dll, dlogp_up))
+            )
 
             # Pre-compute tail constants for readability.
             F_star = Z_ @ P_star @ Z_.mT + stabilize(H_, cov_jitter)

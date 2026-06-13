@@ -570,3 +570,20 @@ def test_convergent_filter_rejects_missing_fill_sentinel(rng):
         ConvergentFilter().build_graph(
             pt.as_tensor_variable(shared_data), a0, P0, c, d, T, Z, R, H, Q
         )
+
+
+def test_convergent_filter_rejects_weighted_likelihood(rng):
+    """The analytic pullback assumes a uniform per-step weight (loss = loglike_obs.sum()). A weighted
+    likelihood gives a non-constant upstream adjoint and must fail loudly rather than silently return
+    the wrong gradient."""
+    m, p, n_shocks, n = 4, 2, 4, 60
+    vals = _make_stationary_system(m, p, n_shocks, n, rng)
+    inputs, outputs = initialize_filter(ConvergentFilter(), p=p, m=m, r=n_shocks, n=n)
+    data_, a0_, P0_, c_, d_, T_, Z_, R_, H_, Q_ = inputs
+    ll_obs = outputs[-1]
+
+    weights = pt.arange(1, n + 1, dtype=floatX)
+    grad_T = pt.grad((weights * ll_obs).sum(), T_)
+    fn = pytensor.function(inputs, grad_T, on_unused_input="ignore")
+    with pytest.raises(AssertionError):
+        fn(*vals)
