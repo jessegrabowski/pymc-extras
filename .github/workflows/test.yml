@@ -48,11 +48,11 @@ jobs:
         # Shards are balanced by measured runtime under numba, about 12-14 minutes each.
         test-subset:
           - tests/model
-          - tests/distributions
+          - tests/distributions tests/statespace/core/test_forward_sampling.py
           - tests --ignore tests/model --ignore tests/statespace --ignore tests/distributions --ignore tests/inference/pathfinder
           - tests/statespace/models/test_VARMAX.py tests/statespace/models/test_SARIMAX.py
           - tests/statespace/models tests/statespace/core/test_statespace.py --ignore tests/statespace/models/test_VARMAX.py --ignore tests/statespace/models/test_SARIMAX.py
-          - tests/statespace/filters/test_kalman_filter.py tests/statespace/core/test_forward_sampling.py
+          - tests/statespace/filters/test_kalman_filter.py
           - tests/statespace --ignore tests/statespace/models --ignore tests/statespace/core/test_statespace.py --ignore tests/statespace/filters/test_kalman_filter.py --ignore tests/statespace/core/test_forward_sampling.py
       fail-fast: false
     runs-on: ${{ matrix.os }}
