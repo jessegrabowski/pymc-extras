@@ -181,8 +181,9 @@ class BayesianETS(PyMCStateSpace):
         no missing data, the likelihood is then evaluated through the innovations recursion instead of
         the Kalman filter.
 
-        :math:`R Q R^T` is singular, so pass ``mvn_method="svd"`` or ``"eigh"`` to the conditional
-        sampling methods, not ``"cholesky"``.
+        :math:`R Q R^T` is singular, so the conditional sampling methods need the default
+        ``mvn_method="svd"``. ``"cholesky"`` has no factor to take, and ``"eigh"`` can square-root a
+        roundoff-negative eigenvalue.
     filter_type: str, default "standard"
         The type of Kalman Filter to use. Options are "standard", "single", "univariate", "steady_state",
         and "cholesky". See the docs for kalman filters for more details.

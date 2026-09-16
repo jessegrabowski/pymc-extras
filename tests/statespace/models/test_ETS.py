@@ -490,8 +490,7 @@ def test_ets_workflow(mock_sample):
 
         idata = pm.sample()
 
-    # Not "cholesky": a single source of error makes P0 singular, so it has no Cholesky factor.
-    post = ss_mod.sample_conditional_posterior(idata, mvn_method="eigh")
+    post = ss_mod.sample_conditional_posterior(idata)
     assert "filtered_posterior" in post
     assert "smoothed_posterior" in post
     assert "predicted_posterior" in post
