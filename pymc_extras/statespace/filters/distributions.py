@@ -770,12 +770,26 @@ def _initial_mean(coefficients, exog_coefficients, exog, *, order, k_endog, exog
     intercepts = exog[1 : order + 1] @ exog_coefficients.T
     initial = pt.linalg.solve(pt.eye(k_endog) - by_lag.sum(axis=1), intercepts[0], b_ndim=1)
 
-    history = [initial] * order
-    for t in range(1, order):
-        lagged = sum(by_lag[:, lag - 1] @ history[-lag] for lag in range(1, order + 1))
-        history.append(lagged + intercepts[t - 1])
+    if order == 1:
+        return initial[None]
 
-    return pt.stack(history[-order:])
+    def step(intercept, history, by_lag):
+        """Advance the recursion one row. ``history`` holds the previous ``order`` means, newest first."""
+        current = pt.einsum("ilj,lj->i", by_lag, history) + intercept
+        return pt.concatenate([current[None], history[:-1]], axis=0)
+
+    # Passing ``by_lag`` explicitly keeps its upstream graph out of the inner function. An
+    # implicit closure would copy it in, and pymc's logp rewrites do not reach inside a scan.
+    history = pytensor.scan(
+        step,
+        sequences=[intercepts[: order - 1]],
+        outputs_info=[pt.tile(initial[None], (order, 1))],
+        non_sequences=[by_lag],
+        strict=True,
+        return_updates=False,
+    )
+
+    return pt.concatenate([initial[None], history[:, 0]], axis=0)
 
 
 def _stationary_cholesky(coefficients, state_cov, *, order, k_endog):
