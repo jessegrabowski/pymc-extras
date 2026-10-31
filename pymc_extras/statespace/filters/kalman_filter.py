@@ -599,9 +599,18 @@ class StandardFilter(BaseFilter):
         observed = pt.bitwise_not(nan_mask).astype(F.dtype)
         F_scored = F * pt.outer(observed, observed) + pt.eye(dim_of(F, 0)) * (1 - observed)
 
-        F_chol = pt.linalg.cholesky(F_scored, lower=True)
-
-        K = pt.linalg.cho_solve((F_chol, True), PZT.mT).mT
+        # A single observation needs no factorization, and dividing by the scalar keeps the
+        # gradient free of Cholesky machinery.
+        if Z.type.shape[-2] == 1:
+            F_scalar = F_scored[0, 0]
+            K = PZT / F_scalar
+            F_inv_v = v / F_scalar
+            F_logdet = pt.log(F_scalar)
+        else:
+            F_chol = pt.linalg.cholesky(F_scored, lower=True)
+            K = pt.linalg.cho_solve((F_chol, True), PZT.mT).mT
+            F_inv_v = pt.linalg.cho_solve((F_chol, True), v)
+            F_logdet = 2 * pt.log(pt.diag(F_chol)).sum()
 
         a_filtered = a + K @ v
 
@@ -611,10 +620,7 @@ class StandardFilter(BaseFilter):
         # cancellation error is left for the jitter added after the update to absorb.
         P_filtered = P - quad_form_sym(K, stabilize(F, self.cov_jitter))
 
-        F_inv_v = pt.linalg.cho_solve((F_chol, True), v)
         inner_term = v.T @ F_inv_v
-
-        F_logdet = 2 * pt.log(pt.diag(F_chol)).sum()
 
         # A fully missing observation scores zero: the count, the innovation and the
         # log-determinant all vanish with it.
