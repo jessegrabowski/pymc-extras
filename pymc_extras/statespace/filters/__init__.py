@@ -1,3 +1,5 @@
+import pymc_extras.statespace.filters.scalarized_step  # noqa: F401  registers the numba rewrite
+
 from pymc_extras.statespace.filters.distributions import (
     LinearGaussianStateSpace,
     SimulationSmoother,
