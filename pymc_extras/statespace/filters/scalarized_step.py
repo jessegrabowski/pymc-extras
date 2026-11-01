@@ -15,11 +15,11 @@ from itertools import product
 import numpy as np
 
 from pytensor.compile import optdb
-from pytensor.compile.builders import OpFromGraph
+from pytensor.compile.builders import FinalizedOpFromGraph, OpFromGraph
 from pytensor.compile.ops import DeepCopyOp, ViewOp
 from pytensor.graph import node_rewriter
 from pytensor.graph.basic import Constant, Variable
-from pytensor.graph.rewriting.basic import dfs_rewriter
+from pytensor.graph.rewriting.basic import copy_stack_trace, dfs_rewriter
 from pytensor.link.numba.cache import compile_numba_function_src
 from pytensor.link.numba.dispatch import basic as numba_basic
 from pytensor.link.numba.dispatch.basic import (
@@ -49,7 +49,7 @@ SUBTENSOR_OPS = (Subtensor, AdvancedSubtensor)
 INC_SUBTENSOR_OPS = (IncSubtensor, AdvancedIncSubtensor)
 
 
-class ScalarizedStep(OpFromGraph):
+class ScalarizedStep(FinalizedOpFromGraph):
     """A scan step whose numba implementation holds every tensor element in its own scalar local."""
 
     def __str__(self):
@@ -181,7 +181,8 @@ def index_string(index):
 class StepScalarizer:
     """Translate a graph into the body of one numba function with a scalar local per tensor element."""
 
-    def __init__(self):
+    def __init__(self, **funcify_kwargs):
+        self.funcify_kwargs = funcify_kwargs
         self.lines = []
         self.env = {"np": np}
         self.kernel_cache_keys = []
@@ -194,7 +195,9 @@ class StepScalarizer:
 
     def scalar_kernel(self, scalar_op, scalar_node):
         name = self.fresh("kernel")
-        self.env[name], cache_key = numba_funcify_and_cache_key(scalar_op, node=scalar_node)
+        self.env[name], cache_key = numba_funcify_and_cache_key(
+            scalar_op, node=scalar_node, **self.funcify_kwargs
+        )
         self.kernel_cache_keys.append(cache_key)
         return name
 
@@ -404,8 +407,7 @@ def scan_step_to_scalarized_step(fgraph, node):
     if operations is None or operations > MAX_SCALARIZED_OPERATIONS:
         return None
 
-    unfrozen = inner.unfreeze()
-    step = ScalarizedStep(list(unfrozen.inputs), list(unfrozen.outputs), inline=False)
+    step = ScalarizedStep(list(inner.inputs), list(inner.outputs), fgraph=inner)
     inner_inputs = [var.type() for var in inner.inputs]
     new_op = Scan(
         inner_inputs,
@@ -420,7 +422,9 @@ def scan_step_to_scalarized_step(fgraph, node):
     )
     new_op.destroy_map = op.destroy_map
     new_op.view_map = op.view_map
-    return new_op(*node.inputs, return_list=True)
+    outputs = new_op(*node.inputs, return_list=True)
+    copy_stack_trace(node.outputs, outputs)
+    return outputs
 
 
 optdb.register(
@@ -433,8 +437,13 @@ optdb.register(
 
 
 @register_funcify_and_cache_key(ScalarizedStep)
-def numba_funcify_ScalarizedStep(op, node, **kwargs):
-    scalarizer = StepScalarizer()
+def numba_funcify_ScalarizedStep(op, node, ofg_memo=None, **kwargs):
+    _ = kwargs.pop("storage_map", None)
+
+    if ofg_memo is not None and op in ofg_memo:
+        return ofg_memo[op]
+
+    scalarizer = StepScalarizer(ofg_memo=ofg_memo, **kwargs)
     source = scalarizer.source(op.fgraph, "scalarized_step")
     scalarized_step = compile_numba_function_src(source, "scalarized_step", scalarizer.env)
 
@@ -445,4 +454,8 @@ def numba_funcify_ScalarizedStep(op, node, **kwargs):
         cache_key = sha256(
             str((type(op), source, scalarizer.kernel_cache_keys, cache_version)).encode()
         ).hexdigest()
-    return numba_basic.numba_njit(scalarized_step, boundscheck=False), cache_key
+
+    result = numba_basic.numba_njit(scalarized_step, boundscheck=False), cache_key
+    if ofg_memo is not None:
+        ofg_memo[op] = result
+    return result
