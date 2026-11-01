@@ -41,6 +41,7 @@ dependencies = [
   "pandas>=2.2,<3.2",
   "pydantic>=2.0.0,<3.0",
   "preliz>=0.27.0,<0.29.0",
+  "pytensor-ml>=0.3.0,<0.4",
 ]
 
 [project.optional-dependencies]
@@ -65,6 +66,9 @@ dask_histogram = [
 ]
 histogram = [
   "xhistogram",
+]
+mlx_mclmc = [
+  "mlx>=0.32; platform_machine == 'arm64' and sys_platform == 'darwin'",
 ]
 
 [project.urls]
