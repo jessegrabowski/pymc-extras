@@ -18,10 +18,12 @@ from numpy.testing import assert_allclose
 from pymc import modelcontext
 from pytensor.graph.replace import graph_replace
 from pytensor.graph.traversal import explicit_graph_inputs
+from pytensor.scan.op import Scan
 
 from pymc_extras.statespace.core.statespace import PyMCStateSpace
 from pymc_extras.statespace.filters import StandardFilter
 from pymc_extras.statespace.filters.kalman_smoother import RTSSmoother
+from pymc_extras.statespace.filters.scalarized_step import ScalarizedStep
 from pymc_extras.statespace.utils.constants import (
     MATRIX_NAMES,
     SHORT_NAME_TO_LONG,
@@ -418,3 +420,12 @@ def make_statespace_mod(
     ss._needs_exog_data = data_info is not None
 
     return ss
+
+
+def scalarized_scans(fn):
+    """Whether each scan in the compiled ``fn`` has a single ``ScalarizedStep`` as its step."""
+    return [
+        [type(inner.op) for inner in node.op.fgraph.apply_nodes] == [ScalarizedStep]
+        for node in fn.maker.fgraph.apply_nodes
+        if isinstance(node.op, Scan)
+    ]

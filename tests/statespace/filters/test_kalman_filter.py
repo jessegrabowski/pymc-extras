@@ -7,7 +7,6 @@ import pytensor.tensor as pt
 import pytest
 
 from numpy.testing import assert_allclose, assert_array_less
-from pytensor.scan.op import Scan
 
 from pymc_extras.statespace.filters import (
     DisturbanceSmoother,
@@ -17,7 +16,6 @@ from pymc_extras.statespace.filters import (
     UnivariateFilter,
 )
 from pymc_extras.statespace.filters.kalman_filter import BaseFilter
-from pymc_extras.statespace.filters.scalarized_step import ScalarizedStep
 from pymc_extras.statespace.utils.constants import (
     LONG_NAME_TO_SHORT,
     MATRIX_NAMES,
@@ -32,6 +30,7 @@ from tests.statespace.test_utilities import (
     initialize_filter,
     make_test_inputs,
     nile_test_test_helper,
+    scalarized_scans,
     statsmodels_loglike_obs,
 )
 
@@ -834,7 +833,4 @@ def test_standard_filter_scan_steps_are_scalarized():
     logp = outputs[-1].sum()
     fn = pytensor.function(inputs, [logp, *pt.grad(logp, inputs[1:])], mode="NUMBA")
 
-    scans = [node.op for node in fn.maker.fgraph.apply_nodes if isinstance(node.op, Scan)]
-    assert len(scans) == 2
-    for scan in scans:
-        assert all(isinstance(node.op, ScalarizedStep) for node in scan.fgraph.apply_nodes)
+    assert scalarized_scans(fn) == [True, True]

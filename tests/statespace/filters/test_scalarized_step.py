@@ -5,20 +5,18 @@ import pytest
 
 from numpy.testing import assert_allclose
 from pytensor.compile.mode import get_mode
-from pytensor.scan.op import Scan
 
-from pymc_extras.statespace.filters.scalarized_step import ScalarizedStep
+from pymc_extras.statespace.filters.scalarized_step import (
+    MAX_SCALARIZED_ELEMENTS,
+    scan_step_to_scalarized_step,
+)
+from tests.statespace.shared_fixtures import (  # pylint: disable=unused-import
+    rng,
+)
+from tests.statespace.test_utilities import scalarized_scans
 
-NUMBA_MODE = "NUMBA"
-REFERENCE_MODE = get_mode(NUMBA_MODE).excluding("scan_step_to_scalarized_step")
-
-
-def scalarized_scans(fn):
-    return [
-        all(isinstance(inner.op, ScalarizedStep) for inner in node.op.fgraph.apply_nodes)
-        for node in fn.maker.fgraph.apply_nodes
-        if isinstance(node.op, Scan)
-    ]
+REFERENCE_MODE = get_mode("NUMBA").excluding("scan_step_to_scalarized_step")
+TOLERANCE = {"float64": 1e-12, "float32": 1e-6}
 
 
 def compile_scan_and_gradient(step, x0, mode):
@@ -63,17 +61,16 @@ def compile_scan_and_gradient(step, x0, mode):
         ),
     ],
 )
-def test_scalarized_scan_matches_reference(step, dtype):
+def test_scalarized_scan_matches_reference(step, dtype, rng):
     x0 = pt.matrix("x0", shape=(3, 3), dtype=dtype)
-    fn = compile_scan_and_gradient(step, x0, NUMBA_MODE)
+    fn = compile_scan_and_gradient(step, x0, "NUMBA")
     assert scalarized_scans(fn) == [True, True]
 
-    x_value = (np.arange(9.0).reshape(3, 3) / 10).astype(dtype)
     reference = compile_scan_and_gradient(step, x0, REFERENCE_MODE)
-    rtol = 1e-12 if dtype == "float64" else 1e-6
-    for actual, expected in zip(fn(x_value), reference(x_value), strict=True):
-        assert actual.dtype == expected.dtype
-        assert_allclose(actual, expected, rtol=rtol)
+    tolerance = TOLERANCE[dtype]
+    for x_value in rng.normal(size=(3, 3, 3)).astype(dtype):
+        for actual, expected in zip(fn(x_value), reference(x_value), strict=True):
+            assert_allclose(actual, expected, rtol=tolerance, atol=tolerance, strict=True)
 
 
 def test_zero_times_nan_stays_nan():
@@ -82,7 +79,7 @@ def test_zero_times_nan_stays_nan():
     trajectory = pytensor.scan(
         lambda x: zeros_on_left @ x + 1.0, outputs_info=[x0], n_steps=2, return_updates=False
     )
-    fn = pytensor.function([x0], trajectory[-1], mode=NUMBA_MODE)
+    fn = pytensor.function([x0], trajectory[-1], mode="NUMBA")
     assert scalarized_scans(fn) == [True]
 
     # The second row of the second step is 0 * nan + 1, so it is nan only if the zero product is kept.
@@ -93,7 +90,7 @@ def test_zero_times_nan_stays_nan():
     "shape, step",
     [
         pytest.param((None, 3), pt.tanh, id="dynamic shape"),
-        pytest.param((9, 9), pt.tanh, id="too large"),
+        pytest.param((1, MAX_SCALARIZED_ELEMENTS + 1), pt.tanh, id="too large"),
         pytest.param(
             (3, 3), lambda x: pt.linalg.cholesky(x @ x.mT + pt.eye(3)), id="unsupported op"
         ),
@@ -102,6 +99,6 @@ def test_zero_times_nan_stays_nan():
 def test_scan_is_not_scalarized(shape, step):
     x0 = pt.matrix("x0", shape=shape)
     trajectory = pytensor.scan(step, outputs_info=[x0], n_steps=4, return_updates=False)
-    fn = pytensor.function([x0], trajectory[-1], mode=NUMBA_MODE)
+    scan_node = trajectory.owner.inputs[0].owner
 
-    assert scalarized_scans(fn) == [False]
+    assert scan_step_to_scalarized_step.transform(None, scan_node) is None
