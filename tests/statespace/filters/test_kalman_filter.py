@@ -797,7 +797,10 @@ def test_convergent_filter_rejects_missing_fill_sentinel(rng):
         )
 
 
-def test_convergent_filter_builds_and_runs_at_float32(rng):
+@pytest.mark.parametrize(
+    "filter_cls", [ConvergentFilter, StandardFilter, SquareRootFilter, UnivariateFilter]
+)
+def test_filter_builds_and_runs_at_float32(filter_cls, rng):
     """The filter follows ``pytensor.config.floatX``; nothing in its graph is pinned to float64."""
     m, p, n_shocks, n = 3, 2, 3, 60
     vals = _make_stationary_system(m, p, n_shocks, n, rng)
@@ -818,8 +821,9 @@ def test_convergent_filter_builds_and_runs_at_float32(rng):
         }
         inputs = [pt.tensor(name, dtype=dtype, shape=shape) for name, shape in shapes.items()]
 
-        *_, ll_obs = ConvergentFilter().build_graph(*inputs)
+        *_, ll_obs = filter_cls().build_graph(*inputs)
         loss = ll_obs.sum()
+        assert loss.dtype == "float32"
         fn = pytensor.function(inputs, [loss, *pt.grad(loss, inputs[1:])], on_unused_input="ignore")
 
     results = fn(*[np.asarray(v, dtype=dtype) for v in vals])

@@ -30,7 +30,9 @@ from pymc_extras.statespace.utils.constants import (
     MISSING_FILL,
 )
 
-MVN_CONST = pt.log(2 * pt.constant(np.pi, dtype="float64"))
+# A Python float takes on floatX in the graph, where a float64 constant would upcast float32
+# likelihoods.
+MVN_CONST = float(np.log(2 * np.pi))
 
 assert_time_varying_dim_correct = Assert(
     "The first dimension of a time varying matrix (the time dimension) must be "
@@ -835,7 +837,8 @@ class UnivariateFilter(BaseFilter):
         P_filtered = stabilize(0.5 * (P_filtered + P_filtered.mT), self.cov_jitter)
         a_hat, P_hat = self.predict(a=a_filtered, P=P_filtered, c=c, T=T, R=R, Q=Q)
 
-        ll = -0.5 * (pt.bitwise_not(nan_mask).sum() * MVN_CONST + ll_inner.sum())
+        n_observed = pt.bitwise_not(nan_mask).astype(ll_inner.dtype).sum()
+        ll = -0.5 * (n_observed * MVN_CONST + ll_inner.sum())
 
         return a_filtered, a_hat, obs_mu, P_filtered, P_hat, obs_cov, ll
 
