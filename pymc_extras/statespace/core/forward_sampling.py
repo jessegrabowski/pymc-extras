@@ -26,7 +26,6 @@ from pymc_extras.statespace.utils.constants import (
     ALL_STATE_DIM,
     FILTER_OUTPUT_DIMS,
     FILTER_OUTPUT_TYPES,
-    JITTER_DEFAULT,
     LONG_MATRIX_NAMES,
     MATRIX_DIMS,
     MATRIX_NAMES,
@@ -299,7 +298,7 @@ def _sample_unconditional(
         x0, P0, c, d, T, Z, R, H, Q = matrices
 
         if not ss_mod.measurement_error:
-            H_jittered = pm.Deterministic("H_jittered", stabilize(H, JITTER_DEFAULT))
+            H_jittered = pm.Deterministic("H_jittered", stabilize(H, ss_mod.cov_jitter))
             matrices = [x0, P0, c, d, T, Z, R, H_jittered, Q]
 
         LinearGaussianStateSpace(
