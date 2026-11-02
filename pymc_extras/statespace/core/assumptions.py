@@ -4,14 +4,12 @@ from pytensor.assumptions import (
     SpecifyAssumptions,
     check_assumption,
     register_assumption,
-    specify_assumption_rule,
 )
 from pytensor.graph.basic import Variable
 from pytensor.graph.fg import FunctionGraph
 from pytensor.tensor.basic import Join
 from pytensor.tensor.blockwise import Blockwise
 from pytensor.tensor.elemwise import Elemwise
-from pytensor.tensor.rewriting.assumptions import _KEY_BY_NAME
 from pytensor.tensor.subtensor import (
     AdvancedIncSubtensor,
     AdvancedSubtensor,
@@ -20,13 +18,6 @@ from pytensor.tensor.subtensor import (
 )
 
 TIME_VARYING = AssumptionKey("time_varying", "tv")
-
-# Lets the feature read a declaration back off the node ``declare_time_varying`` inserts.
-register_assumption(TIME_VARYING, SpecifyAssumptions)(specify_assumption_rule)
-
-# The rewrite that drains declarations into the assumption cache snapshots the key registry when
-# pytensor imports, which is always before this module, so add ours to the snapshot by hand.
-_KEY_BY_NAME[TIME_VARYING.name] = TIME_VARYING
 
 
 @register_assumption(TIME_VARYING, Subtensor, AdvancedSubtensor)
@@ -97,7 +88,7 @@ def declare_time_varying(tensor: Variable) -> Variable:
     declared : TensorVariable
         A no-op view of ``tensor`` that downstream code can ask about.
     """
-    return SpecifyAssumptions({TIME_VARYING.name: FactState.TRUE})(tensor)
+    return SpecifyAssumptions({TIME_VARYING: FactState.TRUE})(tensor)
 
 
 def is_time_varying(*tensors: Variable) -> list[bool]:
