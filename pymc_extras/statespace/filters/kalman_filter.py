@@ -604,8 +604,8 @@ class StandardFilter(BaseFilter):
 
         # Equal to the Joseph form (I - KZ) P (I - KZ)^T + K H K^T, whose H carries no jitter, at
         # O(k_states^2 k_endog) cost instead of O(k_states^3). Unlike the Joseph form it is not PSD by
-        # construction: it subtracts nearly equal terms when H is small next to Z P Z^T, and the
-        # cancellation error is left for the jitter added after the update to absorb.
+        # construction: it subtracts nearly equal terms when H is small next to Z P Z^T, so the
+        # result can carry eigenvalues below zero at rounding level.
         P_filtered = P - quad_form_sym(K, stabilize(F, self.cov_jitter))
 
         F_inv_v = pt.linalg.cho_solve((F_chol, True), v)
